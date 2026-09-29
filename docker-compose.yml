@@ -1,0 +1,20 @@
+services:
+  shadowtrap:
+    build: .
+    container_name: shadowtrap
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "2222:2222"
+      - "2121:21"
+      - "2323:23"
+      - "2525:25"
+      - "8080:80"
+      - "1110:110"
+      - "1143:143"
+      - "3307:3306"
+      - "4445:445"
+      - "33890:3389"
+    volumes:
+      - ./ssh_honeypot.log:/app/ssh_honeypot.log
+      - ./server_rsa.key:/app/server_rsa.key:ro
