@@ -1,33 +1,43 @@
-import socket
-import threading
 import datetime
-import paramiko
+import os
 import signal
+import socket
 import sys
-import requests
+import threading
 
-LOGFILE = "ssh_honeypot.log"
-SSH_PORT = 22
-USERNAME = "admin"
-PASSWORD = "admin"
+import paramiko
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+LOGFILE = os.getenv("LOGFILE", "ssh_honeypot.log")
+SSH_PORT = int(os.getenv("SSH_PORT", "2222"))
+USERNAME = os.getenv("HONEYPOT_USER", "admin")
+PASSWORD = os.getenv("HONEYPOT_PASS", "admin")
+HOST_KEY_FILE = os.getenv("HOST_KEY_FILE", "server_rsa.key")
+# SECURITY: never hardcode webhooks. Set DISCORD_WEBHOOK_URL in .env
+# Old webhook leaked in git history - rotate it in Discord now.
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 RUNNING = True  # Flag to control graceful shutdown
-WEBHOOK_URL = "https://discord.com/api/webhooks/1381186649752600627/pQ-bAqTcG8_k7MqtylsymEJQTqNHB33Hd4nb6woMq9EFFH7sgCNvrnWwaHnHxlLeyIna"
 
 # Set to track IPs already logged with geo info
-
-
 seen_ips = set()
+
 
 def log(msg):
     now = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    print(f"{now} {msg}")
+    print(f"{now} {msg}", flush=True)
     with open(LOGFILE, "a") as f:
         f.write(f"{now} {msg}\n")
 
+
 def send_webhook_alert(message):
+    if not WEBHOOK_URL:
+        return
     try:
         data = {"content": message}
-        response = requests.post(WEBHOOK_URL, json=data)
+        response = requests.post(WEBHOOK_URL, json=data, timeout=10)
         if response.status_code == 204:
             log("Webhook alert sent successfully.")
         else:
@@ -35,17 +45,18 @@ def send_webhook_alert(message):
     except Exception as e:
         log(f"Failed to send webhook alert: {e}")
 
+
 def log_geoip(ip):
     if ip in seen_ips:
         return  # Already logged, skip
     seen_ips.add(ip)
 
     try:
-        response = requests.get(f"https://ipapi.co/{ip}/json/")
+        response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=10)
         data = response.json()
 
         location_info = f"""
-🌍 New Intrusion from IP: {ip}
+\U0001f30d New Intrusion from IP: {ip}
 - Country: {data.get('country_name', 'N/A')}
 - Region: {data.get('region', 'N/A')}
 - City: {data.get('city', 'N/A')}
@@ -59,6 +70,7 @@ def log_geoip(ip):
         send_webhook_alert(location_info.strip())
     except Exception as e:
         log(f"GeoIP lookup failed for {ip}: {e}")
+
 
 class SSHHandler(paramiko.ServerInterface):
     def __init__(self, client_ip):
@@ -87,6 +99,7 @@ class SSHHandler(paramiko.ServerInterface):
         self.event.set()
         return True
 
+
 def handle_connection(client, addr):
     ip = addr[0]
     log(f"Incoming SSH connection from {ip}")
@@ -95,7 +108,11 @@ def handle_connection(client, addr):
 
     try:
         transport = paramiko.Transport(client)
-        host_key = paramiko.RSAKey(filename="server_rsa.key")
+        if not os.path.exists(HOST_KEY_FILE):
+            log(f"Host key {HOST_KEY_FILE} not found. Generate with: ssh-keygen -t rsa -b 2048 -m PEM -f {HOST_KEY_FILE} -N \"\"")
+            client.close()
+            return
+        host_key = paramiko.RSAKey(filename=HOST_KEY_FILE)
         transport.add_server_key(host_key)
 
         server = SSHHandler(ip)
@@ -112,7 +129,7 @@ def handle_connection(client, addr):
             return
 
         log(f"[+] Attacker {ip} successfully logged into fake SSH shell")
-        send_webhook_alert(f"\ud83d\udea8 SSH Honeypot Alert: Attacker `{ip}` successfully logged into the fake SSH shell using username='{USERNAME}' and password='{PASSWORD}'")
+        send_webhook_alert(f"\U0001f6a8 SSH Honeypot Alert: Attacker `{ip}` logged into fake SSH shell")
 
         chan.sendall("Welcome to Ubuntu 20.04.6 LTS (GNU/Linux 5.4.0-91-generic x86_64)\r\n")
         chan.sendall("You have new mail.\r\n\r\n$ ")
@@ -136,7 +153,7 @@ def handle_connection(client, addr):
                 elif command == "ls":
                     chan.sendall(f"$ {command}\r\nDocuments  Downloads  Music  Pictures  Videos\r\n$ ")
                 elif command == "whoami":
-                    chan.sendall(f"$ {command}\r\nadmin\r\n$ ")
+                    chan.sendall(f"$ {command}\r\n{USERNAME}\r\n$ ")
                 elif command == "uname -a":
                     chan.sendall(f"$ {command}\r\nLinux fakebox 5.4.0-91-generic x86_64 GNU/Linux\r\n$ ")
                 elif command.startswith("cat "):
@@ -148,6 +165,7 @@ def handle_connection(client, addr):
         log(f"SSH error from {ip}: {e}")
     finally:
         client.close()
+
 
 def fake_service(port, banner):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -163,11 +181,12 @@ def fake_service(port, banner):
             log_geoip(ip)  # GeoIP info on first intrusion attempt per IP
             try:
                 conn.sendall(banner.encode())
-            except:
+            except Exception:
                 pass
             conn.close()
     except Exception as e:
         log(f"Error on port {port}: {e}")
+
 
 def start_honeypot():
     signal.signal(signal.SIGINT, shutdown)
@@ -183,7 +202,7 @@ def start_honeypot():
         143: "* OK IMAP4rev1 Service Ready\r\n",
         3306: "\x00\x00\x00\x0aFakeMySQL5.5.5-10.3.29-MariaDB-0+deb10u1",
         445: "SMB negotiation failed.\r\n",
-        3389: "RDP Negotiation Response Error.\r\n"
+        3389: "RDP Negotiation Response Error.\r\n",
     }
 
     for port, banner in banners.items():
@@ -197,14 +216,16 @@ def start_honeypot():
     try:
         sock.bind(("0.0.0.0", SSH_PORT))
     except PermissionError:
-        log(f"Permission denied on port {SSH_PORT}. Try sudo or use port >1024.")
+        log(f"Permission denied on port {SSH_PORT}. Use sudo, set SSH_PORT=2222, or redirect 22->2222 with iptables.")
         return
     except OSError:
-        log(f"Port {SSH_PORT} in use. Stop other service or change port.")
+        log(f"Port {SSH_PORT} in use. Stop other service or change SSH_PORT.")
         return
 
     sock.listen(100)
     log(f"SSH Honeypot started on port {SSH_PORT}")
+    if not WEBHOOK_URL:
+        log("DISCORD_WEBHOOK_URL not set - Discord alerts disabled, file logging only.")
 
     while RUNNING:
         try:
@@ -213,11 +234,13 @@ def start_honeypot():
         except KeyboardInterrupt:
             break
 
+
 def shutdown(sig, frame):
     global RUNNING
     RUNNING = False
     log("Shutting down honeypot...")
     sys.exit(0)
 
+
 if __name__ == "__main__":
-    start_honeypot()     
+    start_honeypot()
